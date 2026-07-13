@@ -224,6 +224,7 @@ func resetSyncTestHooks(t *testing.T) {
 	origStoreListMutationsAfterSeq := storeListMutationsAfterSeq
 	origStoreAckMutationSeq := storeAckMutationSeq
 	origStoreApplyPulledChunk := storeApplyPulledChunk
+	origStoreApplyPulledChunkDeferringRelationFKs := storeApplyPulledChunkDeferringRelationFKs
 	origStoreRecordSynced := storeRecordSynced
 
 	t.Cleanup(func() {
@@ -239,6 +240,7 @@ func resetSyncTestHooks(t *testing.T) {
 		storeListMutationsAfterSeq = origStoreListMutationsAfterSeq
 		storeAckMutationSeq = origStoreAckMutationSeq
 		storeApplyPulledChunk = origStoreApplyPulledChunk
+		storeApplyPulledChunkDeferringRelationFKs = origStoreApplyPulledChunkDeferringRelationFKs
 		storeRecordSynced = origStoreRecordSynced
 	})
 }
@@ -1600,6 +1602,74 @@ func TestLocalImportDependencySafeAcrossChunksRegardlessManifestOrder(t *testing
 	if err != nil || len(prompts) != 1 {
 		t.Fatalf("expected imported prompt, prompts=%d err=%v", len(prompts), err)
 	}
+}
+
+func TestLocalImportDefersOnlyTerminalOrphanRelations(t *testing.T) {
+	t.Run("permanent orphan is deferred with the chunk", func(t *testing.T) {
+		s := newTestStore(t)
+		syncDir := t.TempDir()
+		chunkID := "chunk-orphan-relation"
+		writeManifestFile(t, syncDir, &Manifest{Version: 1, Chunks: []ChunkEntry{{ID: chunkID, CreatedAt: "2025-01-01T00:00:00Z"}}})
+		writeLocalChunkFile(t, syncDir, chunkID, ChunkData{Mutations: []store.SyncMutation{
+			{Entity: store.SyncEntitySession, EntityKey: "sess-orphan", Op: store.SyncOpUpsert, Payload: `{"id":"sess-orphan","project":"proj-a","directory":"/tmp/proj-a"}`},
+			{Entity: store.SyncEntityObservation, EntityKey: "obs-orphan-source", Op: store.SyncOpUpsert, Payload: `{"sync_id":"obs-orphan-source","session_id":"sess-orphan","type":"note","title":"source","content":"valid mutation survives","project":"proj-a","scope":"project"}`},
+			{Entity: store.SyncEntityRelation, EntityKey: "rel-permanent-orphan", Op: store.SyncOpUpsert, Payload: `{"sync_id":"rel-permanent-orphan","source_id":"obs-orphan-source","target_id":"obs-never-arrives","relation":"related","judgment_status":"judged","project":"proj-a"}`},
+		}})
+
+		result, err := New(s, syncDir).Import()
+		if err != nil {
+			t.Fatalf("orphan relation should not stall import: %v", err)
+		}
+		if result.ChunksImported != 1 || result.SessionsImported != 1 || result.ObservationsImported != 1 {
+			t.Fatalf("unexpected import result: %+v", result)
+		}
+		if _, err := s.GetObservationBySyncID("obs-orphan-source"); err != nil {
+			t.Fatalf("expected valid observation imported: %v", err)
+		}
+		var status string
+		if err := s.DB().QueryRow(`SELECT apply_status FROM sync_apply_deferred WHERE sync_id = ?`, "rel-permanent-orphan").Scan(&status); err != nil {
+			t.Fatalf("read deferred orphan relation: %v", err)
+		}
+		if status != "deferred" {
+			t.Fatalf("expected deferred status, got %q", status)
+		}
+	})
+
+	t.Run("cross-chunk relation resolves before fallback", func(t *testing.T) {
+		s := newTestStore(t)
+		syncDir := t.TempDir()
+		writeManifestFile(t, syncDir, &Manifest{Version: 1, Chunks: []ChunkEntry{
+			{ID: "chunk-relation-first", CreatedAt: "2025-01-01T00:00:00Z"},
+			{ID: "chunk-observations-second", CreatedAt: "2025-01-02T00:00:00Z"},
+		}})
+		writeLocalChunkFile(t, syncDir, "chunk-relation-first", ChunkData{Mutations: []store.SyncMutation{{
+			Entity: store.SyncEntityRelation, EntityKey: "rel-cross-chunk", Op: store.SyncOpUpsert,
+			Payload: `{"sync_id":"rel-cross-chunk","source_id":"obs-cross-source","target_id":"obs-cross-target","relation":"related","judgment_status":"judged","project":"proj-a"}`,
+		}}})
+		writeLocalChunkFile(t, syncDir, "chunk-observations-second", ChunkData{Mutations: []store.SyncMutation{
+			{Entity: store.SyncEntitySession, EntityKey: "sess-cross-relation", Op: store.SyncOpUpsert, Payload: `{"id":"sess-cross-relation","project":"proj-a","directory":"/tmp/proj-a"}`},
+			{Entity: store.SyncEntityObservation, EntityKey: "obs-cross-source", Op: store.SyncOpUpsert, Payload: `{"sync_id":"obs-cross-source","session_id":"sess-cross-relation","type":"note","title":"source","content":"source","project":"proj-a","scope":"project"}`},
+			{Entity: store.SyncEntityObservation, EntityKey: "obs-cross-target", Op: store.SyncOpUpsert, Payload: `{"sync_id":"obs-cross-target","session_id":"sess-cross-relation","type":"note","title":"target","content":"target","project":"proj-a","scope":"project"}`},
+		}})
+
+		result, err := New(s, syncDir).Import()
+		if err != nil {
+			t.Fatalf("cross-chunk relation should resolve in a strict later pass: %v", err)
+		}
+		if result.ChunksImported != 2 {
+			t.Fatalf("expected both chunks imported, got %+v", result)
+		}
+		if _, err := s.GetRelation("rel-cross-chunk"); err != nil {
+			t.Fatalf("expected relation applied after observations: %v", err)
+		}
+		var deferred int
+		if err := s.DB().QueryRow(`SELECT COUNT(*) FROM sync_apply_deferred WHERE sync_id = ?`, "rel-cross-chunk").Scan(&deferred); err != nil {
+			t.Fatalf("count deferred cross-chunk relation: %v", err)
+		}
+		if deferred != 0 {
+			t.Fatalf("cross-chunk relation was prematurely deferred")
+		}
+	})
 }
 
 func TestLocalImportOrdersExplicitMutationsAndDirectArraysSafely(t *testing.T) {

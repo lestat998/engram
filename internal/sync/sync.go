@@ -59,6 +59,9 @@ var (
 	storeApplyPulledChunk = func(s *store.Store, targetKey, chunkID string, mutations []store.SyncMutation) error {
 		return s.ApplyPulledChunk(targetKey, chunkID, mutations)
 	}
+	storeApplyPulledChunkDeferringRelationFKs = func(s *store.Store, targetKey, chunkID string, mutations []store.SyncMutation) error {
+		return s.ApplyPulledChunkDeferringRelationFKs(targetKey, chunkID, mutations)
+	}
 	storeRecordSynced = func(s *store.Store, targetKey, chunkID string) error {
 		return s.RecordSyncedChunkForTarget(targetKey, chunkID)
 	}
@@ -623,6 +626,23 @@ func (sy *Syncer) importEntriesDependencySafe(entries []ChunkEntry, knownChunks 
 			if len(nextPending) == 0 {
 				return result, nil
 			}
+			hasRelationFKMiss := false
+			for _, entry := range nextPending {
+				if errors.Is(lastErrors[entry.ID], store.ErrRelationFKMissing) {
+					hasRelationFKMiss = true
+					break
+				}
+			}
+			if hasRelationFKMiss {
+				remaining, err := sy.importEntriesDeferringRelationFKs(nextPending, knownChunks, result, lastErrors)
+				if err != nil {
+					return nil, err
+				}
+				if len(remaining) == 0 {
+					return result, nil
+				}
+				nextPending = remaining
+			}
 			stalled := nextPending[0]
 			return nil, fmt.Errorf("dependency-safe %s import stalled after %d pass(es); chunk %s: %w", mode, pass, stalled.ID, lastErrors[stalled.ID])
 		}
@@ -633,10 +653,45 @@ func (sy *Syncer) importEntriesDependencySafe(entries []ChunkEntry, knownChunks 
 	return result, nil
 }
 
+func (sy *Syncer) importEntriesDeferringRelationFKs(entries []ChunkEntry, knownChunks map[string]bool, result *ImportResult, lastErrors map[string]error) ([]ChunkEntry, error) {
+	remaining := make([]ChunkEntry, 0, len(entries))
+	for _, entry := range entries {
+		chunkJSON, err := sy.transport.ReadChunk(entry.ID)
+		if err != nil {
+			return nil, fmt.Errorf("read chunk %s: %w", entry.ID, err)
+		}
+
+		var chunk ChunkData
+		if err := json.Unmarshal(chunkJSON, &chunk); err != nil {
+			return nil, fmt.Errorf("parse chunk %s: %w", entry.ID, err)
+		}
+		if err := sy.importMutationChunkDeferringRelationFKs(entry.ID, chunk); err != nil {
+			lastErrors[entry.ID] = importDependencyError(chunk, err)
+			remaining = append(remaining, entry)
+			continue
+		}
+
+		importResult := estimateMutationImportResult(chunk)
+		knownChunks[entry.ID] = true
+		delete(lastErrors, entry.ID)
+		result.ChunksImported++
+		result.SessionsImported += importResult.SessionsImported
+		result.ObservationsImported += importResult.ObservationsImported
+		result.PromptsImported += importResult.PromptsImported
+	}
+	return remaining, nil
+}
+
 func (sy *Syncer) importMutationChunk(chunkID string, chunk ChunkData) error {
 	mutations := buildImportMutations(chunk)
 	mutations = orderMutationsForApply(mutations)
 	return storeApplyPulledChunk(sy.store, sy.chunkTrackingTargetKey(""), chunkID, mutations)
+}
+
+func (sy *Syncer) importMutationChunkDeferringRelationFKs(chunkID string, chunk ChunkData) error {
+	mutations := buildImportMutations(chunk)
+	mutations = orderMutationsForApply(mutations)
+	return storeApplyPulledChunkDeferringRelationFKs(sy.store, sy.chunkTrackingTargetKey(""), chunkID, mutations)
 }
 
 func importDependencyError(chunk ChunkData, err error) error {

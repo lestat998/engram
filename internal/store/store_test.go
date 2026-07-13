@@ -3034,6 +3034,76 @@ func TestApplyPulledChunkIsAtomicAndRetrySafe(t *testing.T) {
 	}
 }
 
+func TestApplyPulledChunkDeferringRelationFKsIsAtomicAndRetrySafe(t *testing.T) {
+	s := newTestStore(t)
+	relation := SyncMutation{
+		Entity:    SyncEntityRelation,
+		EntityKey: "rel-orphan-chunk",
+		Op:        SyncOpUpsert,
+		Payload:   `{"sync_id":"rel-orphan-chunk","source_id":"obs-missing-source","target_id":"obs-missing-target","relation":"related","judgment_status":"judged","project":"engram"}`,
+	}
+	session := SyncMutation{
+		Entity:    SyncEntitySession,
+		EntityKey: "chunk-fallback-session",
+		Op:        SyncOpUpsert,
+		Payload:   `{"id":"chunk-fallback-session","project":"engram","directory":"/remote"}`,
+	}
+
+	invalidChunk := []SyncMutation{
+		session,
+		relation,
+		{Entity: "unknown", EntityKey: "hard-error", Op: SyncOpUpsert, Payload: `{}`},
+	}
+	if err := s.ApplyPulledChunkDeferringRelationFKs(DefaultSyncTargetKey, "chunk-fallback", invalidChunk); err == nil {
+		t.Fatal("expected non-relation error to abort fallback chunk")
+	}
+	if _, err := s.GetSession("chunk-fallback-session"); err == nil {
+		t.Fatal("expected valid mutation to roll back after hard error")
+	}
+	if got := countDeferredRows(t, s, relation.EntityKey); got != 0 {
+		t.Fatalf("expected deferred relation to roll back after hard error, got %d rows", got)
+	}
+	chunks, err := s.GetSyncedChunksForTarget(DefaultSyncTargetKey)
+	if err != nil {
+		t.Fatalf("get synced chunks after failed fallback: %v", err)
+	}
+	if chunks["chunk-fallback"] {
+		t.Fatal("failed fallback chunk must not be marked synced")
+	}
+
+	validChunk := []SyncMutation{session, relation}
+	if err := s.ApplyPulledChunkDeferringRelationFKs(DefaultSyncTargetKey, "chunk-fallback", validChunk); err != nil {
+		t.Fatalf("apply fallback chunk: %v", err)
+	}
+	if _, err := s.GetSession("chunk-fallback-session"); err != nil {
+		t.Fatalf("expected valid mutation applied: %v", err)
+	}
+	if got := countDeferredRows(t, s, relation.EntityKey); got != 1 {
+		t.Fatalf("expected one deferred relation, got %d", got)
+	}
+	var status, payload string
+	if err := s.db.QueryRow(`SELECT apply_status, payload FROM sync_apply_deferred WHERE sync_id = ?`, relation.EntityKey).Scan(&status, &payload); err != nil {
+		t.Fatalf("read deferred relation: %v", err)
+	}
+	if status != "deferred" || payload != relation.Payload {
+		t.Fatalf("unexpected deferred relation status=%q payload=%q", status, payload)
+	}
+	chunks, err = s.GetSyncedChunksForTarget(DefaultSyncTargetKey)
+	if err != nil {
+		t.Fatalf("get synced chunks after fallback: %v", err)
+	}
+	if !chunks["chunk-fallback"] {
+		t.Fatal("fallback chunk was not marked synced")
+	}
+
+	if err := s.ApplyPulledChunkDeferringRelationFKs(DefaultSyncTargetKey, "chunk-fallback", validChunk); err != nil {
+		t.Fatalf("reapply fallback chunk: %v", err)
+	}
+	if got := countDeferredRows(t, s, relation.EntityKey); got != 1 {
+		t.Fatalf("expected idempotent deferred relation, got %d rows", got)
+	}
+}
+
 func TestApplyPulledPromptDeleteCreatesTombstoneAndRemovesPrompt(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.CreateSession("s-prompt", "engram", "/tmp/engram"); err != nil {

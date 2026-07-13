@@ -5,6 +5,7 @@
 package server
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/subtle"
 	"database/sql"
@@ -322,8 +323,36 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAddObservation(w http.ResponseWriter, r *http.Request) {
+	payload, err := io.ReadAll(r.Body)
+	if err != nil {
+		jsonError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	var rawBody map[string]json.RawMessage
+	if err := json.NewDecoder(bytes.NewReader(payload)).Decode(&rawBody); err != nil {
+		jsonError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	if rawExpectedRevision, ok := rawBody["expected_revision"]; ok && bytes.Equal(bytes.TrimSpace(rawExpectedRevision), []byte("null")) {
+		jsonErrorWithFields(w, http.StatusBadRequest, "expected_revision must be a non-negative integer", map[string]any{
+			"code":       "invalid_expected_revision",
+			"error_code": "invalid_expected_revision",
+			"field":      "expected_revision",
+		})
+		return
+	}
+
 	var body store.AddObservationParams
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(bytes.NewReader(payload)).Decode(&body); err != nil {
+		var typeErr *json.UnmarshalTypeError
+		if errors.As(err, &typeErr) && typeErr.Field == "expected_revision" {
+			jsonErrorWithFields(w, http.StatusBadRequest, "expected_revision must be a non-negative integer", map[string]any{
+				"code":       "invalid_expected_revision",
+				"error_code": "invalid_expected_revision",
+				"field":      "expected_revision",
+			})
+			return
+		}
 		jsonError(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
@@ -335,14 +364,40 @@ func (s *Server) handleAddObservation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id, err := s.store.AddObservation(body)
+	obs, err := s.store.AddObservationWithResult(body)
 	if err != nil {
+		var conflict *store.RevisionConflictError
+		if errors.As(err, &conflict) {
+			fields := map[string]any{
+				"code":              "revision_conflict",
+				"error_code":        "revision_conflict",
+				"expected_revision": conflict.ExpectedRevision,
+			}
+			if conflict.Current != nil {
+				fields["current"] = conflict.Current
+			}
+			jsonErrorWithFields(w, http.StatusConflict, err.Error(), fields)
+			return
+		}
+		if errors.Is(err, store.ErrExpectedRevisionTopic) || errors.Is(err, store.ErrInvalidExpectedRevision) {
+			code := "invalid_expected_revision"
+			if errors.Is(err, store.ErrExpectedRevisionTopic) {
+				code = "expected_revision_requires_topic"
+			}
+			jsonErrorWithFields(w, http.StatusBadRequest, err.Error(), map[string]any{
+				"code":              code,
+				"error_code":        code,
+				"field":             "expected_revision",
+				"expected_revision": body.ExpectedRevision,
+			})
+			return
+		}
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
 	s.notifyWrite()
-	jsonResponse(w, http.StatusCreated, map[string]any{"id": id, "status": "saved"})
+	jsonResponse(w, http.StatusCreated, map[string]any{"id": obs.ID, "sync_id": obs.SyncID, "status": "saved", "revision_count": obs.RevisionCount})
 }
 
 func (s *Server) handlePassiveCapture(w http.ResponseWriter, r *http.Request) {

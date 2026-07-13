@@ -825,6 +825,78 @@ func TestOnWriteNotCalledOnFailedWrites(t *testing.T) {
 	}
 }
 
+func TestPostObservationsCASContract(t *testing.T) {
+	st := newServerTestStore(t)
+	if err := st.CreateSession("s-http-cas", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	h := New(st, 0).Handler()
+
+	post := func(body string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/observations", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	created := post(`{"session_id":"s-http-cas","type":"architecture","title":"Canonical head","content":"revision one","project":"engram","topic_key":"sdd/canonical-head","expected_revision":0}`)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", created.Code, created.Body.String())
+	}
+	var createdBody map[string]any
+	if err := json.Unmarshal(created.Body.Bytes(), &createdBody); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	if createdBody["revision_count"] != float64(1) {
+		t.Fatalf("expected revision_count=1, got %#v", createdBody)
+	}
+	if createdBody["id"] == nil || createdBody["sync_id"] == "" {
+		t.Fatalf("expected committed observation metadata, got %#v", createdBody)
+	}
+
+	conflict := post(`{"session_id":"s-http-cas","type":"architecture","title":"Canonical head","content":"stale","project":"engram","topic_key":"sdd/canonical-head","expected_revision":0}`)
+	if conflict.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d: %s", conflict.Code, conflict.Body.String())
+	}
+	var conflictBody map[string]any
+	if err := json.Unmarshal(conflict.Body.Bytes(), &conflictBody); err != nil {
+		t.Fatalf("decode conflict response: %v", err)
+	}
+	current, ok := conflictBody["current"].(map[string]any)
+	if conflictBody["code"] != "revision_conflict" || conflictBody["error_code"] != "revision_conflict" || conflictBody["expected_revision"] != float64(0) || !ok || current["revision_count"] != float64(1) {
+		t.Fatalf("unexpected conflict response: %#v", conflictBody)
+	}
+
+	omitted := post(`{"session_id":"s-http-cas","type":"architecture","title":"Legacy write","content":"without CAS","project":"engram","topic_key":"sdd/legacy-head"}`)
+	if omitted.Code != http.StatusCreated {
+		t.Fatalf("expected omitted expected_revision to remain accepted, got %d: %s", omitted.Code, omitted.Body.String())
+	}
+
+	for _, tt := range []struct {
+		body     string
+		wantCode string
+	}{
+		{body: `{"session_id":"s-http-cas","type":"architecture","title":"Missing topic","content":"body","project":"engram","expected_revision":0}`, wantCode: "expected_revision_requires_topic"},
+		{body: `{"session_id":"s-http-cas","type":"architecture","title":"Negative revision","content":"body","project":"engram","topic_key":"sdd/other","expected_revision":-1}`, wantCode: "invalid_expected_revision"},
+		{body: `{"session_id":"s-http-cas","type":"architecture","title":"Fractional revision","content":"body","project":"engram","topic_key":"sdd/other","expected_revision":1.5}`, wantCode: "invalid_expected_revision"},
+		{body: `{"session_id":"s-http-cas","type":"architecture","title":"Null revision","content":"body","project":"engram","topic_key":"sdd/other","expected_revision":null}`, wantCode: "invalid_expected_revision"},
+	} {
+		invalid := post(tt.body)
+		if invalid.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400, got %d: %s", invalid.Code, invalid.Body.String())
+		}
+		var invalidBody map[string]any
+		if err := json.Unmarshal(invalid.Body.Bytes(), &invalidBody); err != nil {
+			t.Fatalf("decode validation response: %v", err)
+		}
+		if invalidBody["code"] != tt.wantCode || invalidBody["error_code"] != tt.wantCode || invalidBody["field"] != "expected_revision" {
+			t.Fatalf("unexpected validation response: %#v", invalidBody)
+		}
+	}
+}
+
 func TestHandleStatsReturnsInternalServerErrorOnLoaderError(t *testing.T) {
 	prev := loadServerStats
 	loadServerStats = func(s *store.Store) (*store.Stats, error) {

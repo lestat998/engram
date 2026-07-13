@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -350,6 +351,9 @@ Examples:
 				),
 				mcp.WithString("topic_key",
 					mcp.Description("Optional topic identifier for upserts (e.g. architecture/auth-model). Reuses and updates the latest observation in same project+scope."),
+				),
+				mcp.WithNumber("expected_revision",
+					mcp.Description("Optional topic compare-and-swap revision. Requires topic_key; 0 creates only when absent, N updates only revision N."),
 				),
 				mcp.WithString("project",
 					mcp.Description("Optional explicit project for this memory. Accepted only when backed by known context (existing project, matching session, repo config, or ambiguous-project recovery); invalid or unbacked names fail loudly."),
@@ -1190,6 +1194,16 @@ func handleSave(s *store.Store, cfg MCPConfig, activity *SessionActivity) server
 		sessionID, _ := req.GetArguments()["session_id"].(string)
 		scope, _ := req.GetArguments()["scope"].(string)
 		topicKey, _ := req.GetArguments()["topic_key"].(string)
+		expectedRevision, err := optionalIntegerArg(req, "expected_revision")
+		if err != nil {
+			return saveValidationErrorResult("invalid_expected_revision", err.Error(), req.GetArguments()["expected_revision"]), nil
+		}
+		if expectedRevision != nil && strings.TrimSpace(topicKey) == "" {
+			return saveValidationErrorResult("expected_revision_requires_topic", store.ErrExpectedRevisionTopic.Error(), *expectedRevision), nil
+		}
+		if expectedRevision != nil && *expectedRevision < 0 {
+			return saveValidationErrorResult("invalid_expected_revision", store.ErrInvalidExpectedRevision.Error(), *expectedRevision), nil
+		}
 		projectChoice, _ := req.GetArguments()["project"].(string)
 		_, explicitProjectProvided := req.GetArguments()["project"]
 		projectChoiceReason, _ := req.GetArguments()["project_choice_reason"].(string)
@@ -1252,16 +1266,39 @@ func handleSave(s *store.Store, cfg MCPConfig, activity *SessionActivity) server
 
 		truncated := len(content) > s.MaxObservationLength()
 
-		savedID, err := s.AddObservation(store.AddObservationParams{
-			SessionID: sessionID,
-			Type:      typ,
-			Title:     title,
-			Content:   content,
-			Project:   project,
-			Scope:     scope,
-			TopicKey:  topicKey,
+		saved, err := s.AddObservationWithResult(store.AddObservationParams{
+			SessionID:        sessionID,
+			Type:             typ,
+			Title:            title,
+			Content:          content,
+			Project:          project,
+			Scope:            scope,
+			TopicKey:         topicKey,
+			ExpectedRevision: expectedRevision,
 		})
 		if err != nil {
+			var conflict *store.RevisionConflictError
+			if errors.As(err, &conflict) {
+				envelope := map[string]any{
+					"code":              "revision_conflict",
+					"error_code":        "revision_conflict",
+					"expected_revision": conflict.ExpectedRevision,
+				}
+				if conflict.Current != nil {
+					envelope["current"] = conflict.Current
+				}
+				out, _ := jsonMarshal(envelope)
+				result := mcp.NewToolResultText(string(out))
+				result.IsError = true
+				return result, nil
+			}
+			if errors.Is(err, store.ErrExpectedRevisionTopic) || errors.Is(err, store.ErrInvalidExpectedRevision) {
+				code := "invalid_expected_revision"
+				if errors.Is(err, store.ErrExpectedRevisionTopic) {
+					code = "expected_revision_requires_topic"
+				}
+				return saveValidationErrorResult(code, err.Error(), expectedRevision), nil
+			}
 			return mcp.NewToolResultError("Failed to save: " + err.Error()), nil
 		}
 
@@ -1308,22 +1345,18 @@ func handleSave(s *store.Store, cfg MCPConfig, activity *SessionActivity) server
 		if cfg.Limit != nil {
 			candOpts.Limit = *cfg.Limit
 		}
-		candidates, candErr := s.FindCandidates(savedID, candOpts)
+		candidates, candErr := s.FindCandidates(saved.ID, candOpts)
 		if candErr != nil {
 			// Log only — do not fail the save.
 			fmt.Fprintf(os.Stderr, "engram: FindCandidates error (non-fatal): %v\n", candErr)
 		}
 
-		// Fetch the saved observation's sync_id for the envelope (REQ-001).
-		var savedSyncID string
-		if obs, obsErr := s.GetObservation(savedID); obsErr == nil {
-			savedSyncID = obs.SyncID
-			extra["id"] = savedID
-			extra["sync_id"] = savedSyncID
-			extra["state"] = obs.State()
-			if obs.ReviewAfter != nil {
-				extra["review_after"] = *obs.ReviewAfter
-			}
+		extra["id"] = saved.ID
+		extra["sync_id"] = saved.SyncID
+		extra["state"] = saved.State()
+		extra["revision_count"] = saved.RevisionCount
+		if saved.ReviewAfter != nil {
+			extra["review_after"] = *saved.ReviewAfter
 		}
 
 		if len(candidates) > 0 {
@@ -2949,6 +2982,32 @@ func intArg(req mcp.CallToolRequest, key string, defaultVal int) int {
 		return defaultVal
 	}
 	return int(v)
+}
+
+func optionalIntegerArg(req mcp.CallToolRequest, key string) (*int, error) {
+	raw, ok := req.GetArguments()[key]
+	if !ok {
+		return nil, nil
+	}
+	value, ok := raw.(float64)
+	if !ok || math.IsNaN(value) || math.IsInf(value, 0) || math.Trunc(value) != value {
+		return nil, fmt.Errorf("%s must be an integer", key)
+	}
+	result := int(value)
+	return &result, nil
+}
+
+func saveValidationErrorResult(code, message string, value any) *mcp.CallToolResult {
+	out, _ := jsonMarshal(map[string]any{
+		"code":              code,
+		"error_code":        code,
+		"error":             message,
+		"field":             "expected_revision",
+		"expected_revision": value,
+	})
+	result := mcp.NewToolResultText(string(out))
+	result.IsError = true
+	return result
 }
 
 func boolArg(req mcp.CallToolRequest, key string, defaultVal bool) bool {

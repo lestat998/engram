@@ -679,7 +679,7 @@ func shouldCheckForUpdates(args []string) bool {
 	}
 	command := strings.ToLower(strings.TrimSpace(args[0]))
 	switch command {
-	case "mcp", "serve", "protocol-mode":
+	case "mcp", "serve", "protocol-mode", "capabilities":
 		return false
 	case "cloud":
 		return len(args) < 2 || strings.ToLower(strings.TrimSpace(args[1])) != "serve"
@@ -697,6 +697,12 @@ func handleConfigFreeCommand(args []string) bool {
 		return true
 	case "help", "--help", "-h":
 		printUsage()
+		return true
+	case "capabilities":
+		if err := cmdCapabilities(args[1:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			exitFunc(1)
+		}
 		return true
 	case "cloud":
 		if len(args) >= 2 {
@@ -2703,6 +2709,8 @@ Commands:
                        --watch         Enable auto-sync mode (runs on interval until Ctrl+C)
                        --interval      Sync interval for --watch mode (default: 10m, minimum: 1m)
 
+  capabilities [--json]
+                      Print the install-time feature contract
   version            Print version
   help               Show this help
 

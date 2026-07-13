@@ -12,6 +12,7 @@ This is the complete technical reference for Engram. For getting started, see th
 
 | Section                                                   | What you'll find                                             |
 | --------------------------------------------------------- | ------------------------------------------------------------ |
+| [CLI Capabilities](#cli-capabilities)                     | Stable install-time feature detection                        |
 | [Database Schema](#database-schema)                       | Tables, FTS5, SQLite config                                  |
 | [HTTP API](#http-api-endpoints)                           | All REST endpoints with request/response details             |
 | [MCP Tools](#mcp-tools-20-tools)                          | Detailed reference for all 20 memory tools                   |
@@ -35,6 +36,48 @@ For other docs:
 | [Plugins](docs/PLUGINS.md)                  | OpenCode & Claude Code plugin details                                                         |
 | [Team Usage](docs/TEAM-USAGE.md)            | Scope conventions, language strategy, and sync behavior for collaborative teams               |
 | [Comparison](docs/COMPARISON.md)            | Why Engram vs claude-mem                                                                      |
+
+---
+
+## CLI Capabilities
+
+Installers can detect optional features without starting MCP or opening a database:
+
+```bash
+engram capabilities --json
+```
+
+The JSON contract is deterministic. `schema_version` versions this document shape; consumers should reject unsupported schema versions before reading feature declarations. Schema version 1 is:
+
+```json
+{
+  "schema_version": 1,
+  "features": {
+    "atomic_topic_cas": {
+      "supported": true,
+      "input": {
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 0,
+          "requires": "topic_key"
+        }
+      },
+      "success_fields": [
+        "id",
+        "sync_id",
+        "revision_count"
+      ],
+      "error_codes": [
+        "revision_conflict",
+        "expected_revision_requires_topic",
+        "invalid_expected_revision"
+      ]
+    }
+  }
+}
+```
+
+The command is config-free: it does not perform update checks, start MCP, resolve the data directory, or open a network or database connection. Running `engram capabilities` without `--json` prints a human-readable summary.
 
 ---
 
@@ -133,7 +176,7 @@ Engram is local-first: local SQLite is authoritative; cloud features are optiona
 
 ### Observations
 
-- `POST /observations` — Add observation. Body: `{session_id, type, title, content, tool_name?, project?, scope?, topic_key?}`
+- `POST /observations` — Add observation. Body: `{session_id, type, title, content, tool_name?, project?, scope?, topic_key?, expected_revision?}`. With a topic key, `expected_revision: 0` creates only if absent and `N > 0` updates only revision `N`; conflicts return `409` with current observation metadata.
 - `GET /observations` — Recent observations compatibility endpoint. Query: `?project=X&scope=project|personal|global&limit=N&sort=created_at:desc`
 - `GET /observations/recent` — Recent observations. Query: `?project=X&scope=project|personal|global&limit=N`
 - `GET /observations/{id}` — Get single observation by ID
@@ -842,13 +885,14 @@ Save structured observations. The tool description teaches agents the format:
 - **type**: `decision` | `architecture` | `bugfix` | `pattern` | `config` | `discovery` | `learning`
 - **scope**: `project` (default) | `personal` | `global` — see [Team Usage](docs/TEAM-USAGE.md) for conventions and sync caveats
 - **topic_key**: optional canonical topic id (e.g. `architecture/auth-model`) used to upsert evolving memories
+- **expected_revision**: optional non-negative integer requiring `topic_key`; `0` creates only when absent, while `N > 0` updates only revision `N`
 - **capture_prompt**: optional boolean, default `true`; when current prompt context is available in the same MCP process for the same project/session, Engram best-effort records it alongside the observation. If that process-local context is unavailable or prompt capture fails, `mem_save` still succeeds. Automated pipeline saves such as SDD artifacts should pass `false`.
 - **content**: Structured with `**What**`, `**Why**`, `**Where**`, `**Learned**`; required unless the legacy `observation` alias is provided
 - **observation**: backward-compatible alias for `content` for older/raw MCP clients; prefer `content` for new integrations
 
 Exact duplicate saves are deduplicated in a rolling time window using a normalized content hash + project + scope + type + title.
 When `topic_key` is provided, `mem_save` upserts the latest observation in the same `project + scope + topic_key`, incrementing `revision_count`.
-Save responses include lifecycle metadata for the saved observation: computed `state` (`active` or `needs_review`) and `review_after` when the observation type has a review cycle.
+Save responses include committed `id`, `sync_id`, and `revision_count`, plus lifecycle metadata: computed `state` (`active` or `needs_review`) and `review_after` when the observation type has a review cycle. CAS conflicts return structured code `revision_conflict` with `expected_revision` and current observation metadata. Validation failures return `expected_revision_requires_topic` or `invalid_expected_revision` in both `code` and `error_code` fields.
 
 ### mem_update
 

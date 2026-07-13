@@ -98,6 +98,7 @@ Token-efficient memory retrieval — don't dump everything, drill in:
 - Exact dedupe prevents repeated inserts in a rolling window (hash + project + scope + type + title)
 - Duplicates update metadata (`duplicate_count`, `last_seen_at`, `updated_at`) instead of creating new rows
 - Topic upserts increment `revision_count` so evolving decisions stay in one memory
+- Atomic topic updates can pass `expected_revision`: `0` creates only when no live topic exists, while `N > 0` updates only the live observation at revision `N`; conflicts return the current ID, sync ID, and revision without writing.
 - `mem_delete` uses soft-delete by default (`deleted_at`), with optional hard delete
 - `mem_search`, `mem_context`, recent lists, and timeline ignore soft-deleted observations
 
@@ -290,6 +291,8 @@ engram projects list      Show all projects with obs/session/prompt counts
 engram projects consolidate  Interactive merge of similar project names [--all] [--dry-run]
 engram projects prune     Remove projects with 0 observations [--dry-run]
 engram obsidian-export    Export memories to Obsidian vault (beta)
+engram capabilities --json
+                          Print the config-free install-time feature contract
 engram version            Show version
 ```
 

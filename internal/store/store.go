@@ -46,13 +46,33 @@ var sqliteWriteRetryBackoffs = []time.Duration{
 
 // Sentinel errors returned by delete operations so callers can use errors.Is.
 var (
-	ErrSessionNotFound        = errors.New("session not found")
-	ErrSessionHasObservations = errors.New("session still has observations")
-	ErrSessionDeleteBlocked   = errors.New("session deletion is blocked while cloud sync enrollment is active")
-	ErrObservationNotFound    = errors.New("observation not found")
-	ErrPromptNotFound         = errors.New("prompt not found")
-	ErrProjectNotFound        = errors.New("project not found")
+	ErrSessionNotFound         = errors.New("session not found")
+	ErrSessionHasObservations  = errors.New("session still has observations")
+	ErrSessionDeleteBlocked    = errors.New("session deletion is blocked while cloud sync enrollment is active")
+	ErrObservationNotFound     = errors.New("observation not found")
+	ErrPromptNotFound          = errors.New("prompt not found")
+	ErrProjectNotFound         = errors.New("project not found")
+	ErrExpectedRevisionTopic   = errors.New("expected_revision requires topic_key")
+	ErrInvalidExpectedRevision = errors.New("expected_revision must be greater than or equal to 0")
 )
+
+type RevisionConflictCurrent struct {
+	ID            int64  `json:"id"`
+	SyncID        string `json:"sync_id"`
+	RevisionCount int    `json:"revision_count"`
+}
+
+type RevisionConflictError struct {
+	ExpectedRevision int                      `json:"expected_revision"`
+	Current          *RevisionConflictCurrent `json:"current,omitempty"`
+}
+
+func (e *RevisionConflictError) Error() string {
+	if e.Current == nil {
+		return fmt.Sprintf("revision conflict: expected %d, topic does not exist", e.ExpectedRevision)
+	}
+	return fmt.Sprintf("revision conflict: expected %d, current revision is %d", e.ExpectedRevision, e.Current.RevisionCount)
+}
 
 // Sentinel errors for relation sync apply path (Phase 2).
 var (
@@ -184,14 +204,15 @@ type SearchOptions struct {
 }
 
 type AddObservationParams struct {
-	SessionID string `json:"session_id"`
-	Type      string `json:"type"`
-	Title     string `json:"title"`
-	Content   string `json:"content"`
-	ToolName  string `json:"tool_name,omitempty"`
-	Project   string `json:"project,omitempty"`
-	Scope     string `json:"scope,omitempty"`
-	TopicKey  string `json:"topic_key,omitempty"`
+	SessionID        string `json:"session_id"`
+	Type             string `json:"type"`
+	Title            string `json:"title"`
+	Content          string `json:"content"`
+	ToolName         string `json:"tool_name,omitempty"`
+	Project          string `json:"project,omitempty"`
+	Scope            string `json:"scope,omitempty"`
+	TopicKey         string `json:"topic_key,omitempty"`
+	ExpectedRevision *int   `json:"expected_revision,omitempty"`
 }
 
 type UpdateObservationParams struct {
@@ -2250,6 +2271,16 @@ func (s *Store) SessionObservations(sessionID string, limit int) ([]Observation,
 // ─── Observations ────────────────────────────────────────────────────────────
 
 func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
+	obs, err := s.AddObservationWithResult(p)
+	if err != nil {
+		return 0, err
+	}
+	return obs.ID, nil
+}
+
+// AddObservationWithResult returns the observation metadata read in the same
+// transaction as the committed write.
+func (s *Store) AddObservationWithResult(p AddObservationParams) (*Observation, error) {
 	// Normalize project name (lowercase + trim) before any persistence
 	p.Project, _ = NormalizeProject(p.Project)
 
@@ -2263,10 +2294,69 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 	scope := normalizeScope(p.Scope)
 	normHash := hashNormalized(content)
 	topicKey := normalizeTopicKey(p.TopicKey)
+	if p.ExpectedRevision != nil {
+		if topicKey == "" {
+			return nil, ErrExpectedRevisionTopic
+		}
+		if *p.ExpectedRevision < 0 {
+			return nil, ErrInvalidExpectedRevision
+		}
+	}
 
-	var observationID int64
+	var saved *Observation
 	err := s.withTx(func(tx *sql.Tx) error {
 		var obs *Observation
+		if p.ExpectedRevision != nil {
+			current, err := currentTopicRevisionTx(tx, topicKey, p.Project, scope)
+			if err != nil {
+				return err
+			}
+			expected := *p.ExpectedRevision
+			if expected == 0 {
+				if current != nil {
+					return &RevisionConflictError{ExpectedRevision: expected, Current: current}
+				}
+			} else {
+				if current == nil || current.RevisionCount != expected {
+					return &RevisionConflictError{ExpectedRevision: expected, Current: current}
+				}
+				res, err := s.execHook(tx,
+					`UPDATE observations
+					 SET type = ?,
+					     title = ?,
+					     content = ?,
+					     tool_name = ?,
+					     topic_key = ?,
+					     normalized_hash = ?,
+					     revision_count = revision_count + 1,
+					     last_seen_at = datetime('now'),
+					     updated_at = datetime('now')
+					 WHERE id = ? AND revision_count = ? AND deleted_at IS NULL`,
+					p.Type, title, content, nullableString(p.ToolName), nullableString(topicKey), normHash,
+					current.ID, expected,
+				)
+				if err != nil {
+					return err
+				}
+				rows, err := res.RowsAffected()
+				if err != nil {
+					return err
+				}
+				if rows != 1 {
+					latest, readErr := currentTopicRevisionTx(tx, topicKey, p.Project, scope)
+					if readErr != nil {
+						return readErr
+					}
+					return &RevisionConflictError{ExpectedRevision: expected, Current: latest}
+				}
+				obs, err = s.getObservationTx(tx, current.ID)
+				if err != nil {
+					return err
+				}
+				saved = obs
+				return s.enqueueSyncMutationTx(tx, SyncEntityObservation, obs.SyncID, SyncOpUpsert, observationPayloadFromObservation(obs))
+			}
+		}
 		if topicKey != "" {
 			var existingID int64
 			err := tx.QueryRow(
@@ -2306,7 +2396,7 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 				if err != nil {
 					return err
 				}
-				observationID = existingID
+				saved = obs
 				return s.enqueueSyncMutationTx(tx, SyncEntityObservation, obs.SyncID, SyncOpUpsert, observationPayloadFromObservation(obs))
 			}
 			if err != sql.ErrNoRows {
@@ -2314,10 +2404,11 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 			}
 		}
 
-		window := dedupeWindowExpression(s.cfg.DedupeWindow)
-		var existingID int64
-		err := tx.QueryRow(
-			`SELECT id FROM observations
+		if p.ExpectedRevision == nil {
+			window := dedupeWindowExpression(s.cfg.DedupeWindow)
+			var existingID int64
+			err := tx.QueryRow(
+				`SELECT id FROM observations
 			 WHERE normalized_hash = ?
 			   AND ifnull(project, '') = ifnull(?, '')
 			   AND scope = ?
@@ -2327,28 +2418,29 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 			   AND datetime(created_at) >= datetime('now', ?)
 			 ORDER BY created_at DESC
 			 LIMIT 1`,
-			normHash, nullableString(p.Project), scope, p.Type, title, window,
-		).Scan(&existingID)
-		if err == nil {
-			if _, err := s.execHook(tx,
-				`UPDATE observations
+				normHash, nullableString(p.Project), scope, p.Type, title, window,
+			).Scan(&existingID)
+			if err == nil {
+				if _, err := s.execHook(tx,
+					`UPDATE observations
 				 SET duplicate_count = duplicate_count + 1,
 				     last_seen_at = datetime('now'),
 				     updated_at = datetime('now')
 				 WHERE id = ?`,
-				existingID,
-			); err != nil {
+					existingID,
+				); err != nil {
+					return err
+				}
+				obs, err = s.getObservationTx(tx, existingID)
+				if err != nil {
+					return err
+				}
+				saved = obs
+				return s.enqueueSyncMutationTx(tx, SyncEntityObservation, obs.SyncID, SyncOpUpsert, observationPayloadFromObservation(obs))
+			}
+			if err != sql.ErrNoRows {
 				return err
 			}
-			obs, err = s.getObservationTx(tx, existingID)
-			if err != nil {
-				return err
-			}
-			observationID = existingID
-			return s.enqueueSyncMutationTx(tx, SyncEntityObservation, obs.SyncID, SyncOpUpsert, observationPayloadFromObservation(obs))
-		}
-		if err != sql.ErrNoRows {
-			return err
 		}
 
 		syncID := newSyncID("obs")
@@ -2361,7 +2453,7 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 		if err != nil {
 			return err
 		}
-		observationID, err = res.LastInsertId()
+		observationID, err := res.LastInsertId()
 		if err != nil {
 			return err
 		}
@@ -2383,12 +2475,35 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 		if err != nil {
 			return err
 		}
+		saved = obs
 		return s.enqueueSyncMutationTx(tx, SyncEntityObservation, obs.SyncID, SyncOpUpsert, observationPayloadFromObservation(obs))
 	})
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	return observationID, nil
+	return saved, nil
+}
+
+func currentTopicRevisionTx(tx *sql.Tx, topicKey, project, scope string) (*RevisionConflictCurrent, error) {
+	var current RevisionConflictCurrent
+	err := tx.QueryRow(
+		`SELECT id, ifnull(sync_id, ''), revision_count
+		 FROM observations
+		 WHERE topic_key = ?
+		   AND ifnull(project, '') = ifnull(?, '')
+		   AND scope = ?
+		   AND deleted_at IS NULL
+		 ORDER BY datetime(updated_at) DESC, datetime(created_at) DESC
+		 LIMIT 1`,
+		topicKey, nullableString(project), scope,
+	).Scan(&current.ID, &current.SyncID, &current.RevisionCount)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &current, nil
 }
 
 func (s *Store) RecentObservations(project, scope string, limit int) ([]Observation, error) {

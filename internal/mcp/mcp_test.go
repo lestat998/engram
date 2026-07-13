@@ -5654,10 +5654,94 @@ func TestMemSaveSchemaIncludesCapturePrompt(t *testing.T) {
 	if _, ok := props["observation"]; !ok {
 		t.Fatal("mem_save schema must include backward-compatible observation alias")
 	}
+	if _, ok := props["expected_revision"]; !ok {
+		t.Fatal("mem_save schema must expose expected_revision")
+	}
 	for _, required := range st.Tool.InputSchema.Required {
 		if required == "content" {
 			t.Fatal("mem_save schema must not require content when observation alias is accepted")
 		}
+	}
+}
+
+func TestHandleSaveCASReturnsRevisionAndStableConflictEnvelope(t *testing.T) {
+	s := newMCPTestStore(t)
+	h := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+	base := map[string]any{
+		"title":             "Canonical head",
+		"content":           "revision one",
+		"type":              "architecture",
+		"project":           "engram",
+		"topic_key":         "sdd/canonical-head",
+		"expected_revision": float64(0),
+	}
+
+	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: base}})
+	if err != nil || res.IsError {
+		t.Fatalf("CAS create: err=%v isError=%v body=%s", err, res.IsError, callResultText(t, res))
+	}
+	var success map[string]any
+	if err := json.Unmarshal([]byte(callResultText(t, res)), &success); err != nil {
+		t.Fatalf("decode success envelope: %v", err)
+	}
+	if success["revision_count"] != float64(1) {
+		t.Fatalf("expected revision_count=1, got %#v", success)
+	}
+
+	base["content"] = "must conflict"
+	res, err = h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: base}})
+	if err != nil || !res.IsError {
+		t.Fatalf("CAS conflict: err=%v isError=%v", err, res.IsError)
+	}
+	var conflict map[string]any
+	if err := json.Unmarshal([]byte(callResultText(t, res)), &conflict); err != nil {
+		t.Fatalf("decode conflict envelope: %v", err)
+	}
+	if conflict["code"] != "revision_conflict" || conflict["expected_revision"] != float64(0) {
+		t.Fatalf("unexpected conflict envelope: %#v", conflict)
+	}
+	current, ok := conflict["current"].(map[string]any)
+	if !ok || current["id"] == nil || current["sync_id"] == "" || current["revision_count"] != float64(1) {
+		t.Fatalf("missing current metadata: %#v", conflict)
+	}
+}
+
+func TestHandleSaveCASValidationErrorsAreStructured(t *testing.T) {
+	s := newMCPTestStore(t)
+	h := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+	tests := []struct {
+		name             string
+		expectedRevision any
+		topicKey         string
+		wantCode         string
+	}{
+		{name: "topic required", expectedRevision: float64(0), wantCode: "expected_revision_requires_topic"},
+		{name: "negative", expectedRevision: float64(-1), topicKey: "sdd/head", wantCode: "invalid_expected_revision"},
+		{name: "integer required", expectedRevision: 1.5, topicKey: "sdd/head", wantCode: "invalid_expected_revision"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := map[string]any{
+				"title":             "Invalid CAS",
+				"content":           "body",
+				"project":           "engram",
+				"expected_revision": tt.expectedRevision,
+			}
+			if tt.topicKey != "" {
+				args["topic_key"] = tt.topicKey
+			}
+			res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: args}})
+			if err != nil || !res.IsError {
+				t.Fatalf("expected validation error, err=%v isError=%v", err, res.IsError)
+			}
+			var envelope map[string]any
+			if err := json.Unmarshal([]byte(callResultText(t, res)), &envelope); err != nil {
+				t.Fatalf("decode validation envelope: %v", err)
+			}
+			if envelope["code"] != tt.wantCode || envelope["error_code"] != tt.wantCode || envelope["field"] != "expected_revision" {
+				t.Fatalf("unexpected validation envelope: %#v", envelope)
+			}
+		})
 	}
 }
 

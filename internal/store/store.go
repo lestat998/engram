@@ -4325,14 +4325,7 @@ func (s *Store) ApplyPulledMutation(targetKey string, mutation SyncMutation) err
 			if mutation.Entity == SyncEntityRelation && errors.Is(applyErr, ErrRelationFKMissing) {
 				log.Printf("[store] ApplyPulledMutation: relation FK miss seq=%d entity_key=%s — deferring",
 					mutation.Seq, mutation.EntityKey)
-				if _, deferErr := s.execHook(tx, `
-					INSERT INTO sync_apply_deferred
-						(sync_id, entity, payload, apply_status, retry_count, first_seen_at)
-					VALUES (?, ?, ?, 'deferred', 0, datetime('now'))
-					ON CONFLICT(sync_id) DO UPDATE SET
-						payload            = excluded.payload,
-						last_attempted_at  = datetime('now')
-				`, mutation.EntityKey, mutation.Entity, mutation.Payload); deferErr != nil {
+				if deferErr := s.deferPulledRelationTx(tx, mutation); deferErr != nil {
 					return fmt.Errorf("ApplyPulledMutation: write deferred row: %w", deferErr)
 				}
 				// Fall through to advance the cursor (ACK the seq).
@@ -4372,6 +4365,17 @@ func (s *Store) ApplyPulledMutation(targetKey string, mutation SyncMutation) err
 // and records the chunk as synced in the same transaction. This guarantees
 // retry safety: a failed chunk import leaves no partial semantic mutations.
 func (s *Store) ApplyPulledChunk(targetKey, chunkID string, mutations []SyncMutation) error {
+	return s.applyPulledChunk(targetKey, chunkID, mutations, false)
+}
+
+// ApplyPulledChunkDeferringRelationFKs atomically applies a terminally stalled
+// chunk, deferring only relation mutations whose observation dependencies are
+// still missing. Callers should first exhaust strict dependency-ordering passes.
+func (s *Store) ApplyPulledChunkDeferringRelationFKs(targetKey, chunkID string, mutations []SyncMutation) error {
+	return s.applyPulledChunk(targetKey, chunkID, mutations, true)
+}
+
+func (s *Store) applyPulledChunk(targetKey, chunkID string, mutations []SyncMutation, deferRelationFKs bool) error {
 	targetKey = normalizeSyncTargetKey(targetKey)
 	chunkTargetKey := normalizeChunkTargetKey(targetKey)
 	chunkID = strings.TrimSpace(chunkID)
@@ -4404,6 +4408,12 @@ func (s *Store) ApplyPulledChunk(targetKey, chunkID string, mutations []SyncMuta
 			mutation.TargetKey = targetKey
 			mutation.Source = SyncSourceRemote
 			if err := s.applyPulledMutationTx(tx, mutation); err != nil {
+				if deferRelationFKs && mutation.Entity == SyncEntityRelation && errors.Is(err, ErrRelationFKMissing) {
+					if deferErr := s.deferPulledRelationTx(tx, mutation); deferErr != nil {
+						return fmt.Errorf("apply chunk mutation %d: write deferred row: %w", i, deferErr)
+					}
+					continue
+				}
 				return fmt.Errorf("apply chunk mutation %d: %w", i, err)
 			}
 		}
@@ -4423,6 +4433,19 @@ func (s *Store) ApplyPulledChunk(targetKey, chunkID string, mutations []SyncMuta
 		)
 		return err
 	})
+}
+
+func (s *Store) deferPulledRelationTx(tx *sql.Tx, mutation SyncMutation) error {
+	_, err := s.execHook(tx, `
+		INSERT INTO sync_apply_deferred
+			(sync_id, entity, payload, apply_status, retry_count, first_seen_at)
+		VALUES (?, ?, ?, 'deferred', 0, datetime('now'))
+		ON CONFLICT(sync_id) DO UPDATE SET
+			payload            = excluded.payload,
+			apply_status       = 'deferred',
+			last_attempted_at  = datetime('now')
+	`, mutation.EntityKey, mutation.Entity, mutation.Payload)
+	return err
 }
 
 func (s *Store) GetObservationBySyncID(syncID string) (*Observation, error) {

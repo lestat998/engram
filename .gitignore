@@ -28,4 +28,6 @@ Thumbs.db
 .gemini/skills
 engram-dev
 .atl/
+.codegraph/
+.opencode/
 .release-notes-beta.md

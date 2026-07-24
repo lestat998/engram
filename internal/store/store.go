@@ -3567,10 +3567,12 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
 
 	// Import observations (use new IDs — AUTOINCREMENT)
 	for _, obs := range data.Observations {
-		_, err := s.execHook(tx,
+		syncID := normalizeExistingSyncID(obs.SyncID, "obs")
+		res, err := s.execHook(tx,
 			`INSERT INTO observations (sync_id, session_id, type, title, content, tool_name, project, scope, topic_key, normalized_hash, revision_count, duplicate_count, last_seen_at, review_after, created_at, updated_at, deleted_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			normalizeExistingSyncID(obs.SyncID, "obs"),
+			 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+			 WHERE NOT EXISTS (SELECT 1 FROM observations WHERE sync_id = ?)`,
+			syncID,
 			obs.SessionID,
 			obs.Type,
 			obs.Title,
@@ -3587,11 +3589,20 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
 			obs.CreatedAt,
 			obs.UpdatedAt,
 			obs.DeletedAt,
+			syncID,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("import observation %d: %w", obs.ID, err)
 		}
-		result.ObservationsImported++
+		inserted, err := res.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("import observation %d: rows affected: %w", obs.ID, err)
+		}
+		if inserted == 1 {
+			result.ObservationsImported++
+		} else {
+			result.ObservationsSkipped++
+		}
 	}
 
 	// Import prompts
@@ -3617,6 +3628,7 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
 type ImportResult struct {
 	SessionsImported     int `json:"sessions_imported"`
 	ObservationsImported int `json:"observations_imported"`
+	ObservationsSkipped  int `json:"observations_skipped"`
 	PromptsImported      int `json:"prompts_imported"`
 }
 

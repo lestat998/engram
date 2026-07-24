@@ -890,6 +890,180 @@ func TestExportProjectPreservesSessionReferentialClosure(t *testing.T) {
 	}
 }
 
+func TestImportObservationSyncIDDeduplication(t *testing.T) {
+	newObservation := func(syncID, content string) Observation {
+		project := "engram"
+		return Observation{
+			SyncID:         syncID,
+			SessionID:      "import-session",
+			Type:           "note",
+			Title:          "Imported observation",
+			Content:        content,
+			Project:        &project,
+			Scope:          "project",
+			RevisionCount:  1,
+			DuplicateCount: 1,
+			CreatedAt:      "2026-07-24T12:00:00Z",
+			UpdatedAt:      "2026-07-24T12:00:00Z",
+		}
+	}
+
+	newImportStore := func(t *testing.T) *Store {
+		t.Helper()
+		s := newTestStore(t)
+		if err := s.CreateSession("import-session", "engram", "/tmp/engram"); err != nil {
+			t.Fatalf("create import session: %v", err)
+		}
+		return s
+	}
+
+	t.Run("unique", func(t *testing.T) {
+		s := newImportStore(t)
+		data := &ExportData{Observations: []Observation{
+			newObservation("obs-import-unique-1", "first"),
+			newObservation("obs-import-unique-2", "second"),
+		}}
+
+		result, err := s.Import(data)
+		if err != nil {
+			t.Fatalf("Import: %v", err)
+		}
+		if result.ObservationsImported != 2 || result.ObservationsSkipped != 0 {
+			t.Fatalf("unexpected counts: imported=%d skipped=%d", result.ObservationsImported, result.ObservationsSkipped)
+		}
+
+		var count int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM observations WHERE sync_id LIKE 'obs-import-unique-%'`).Scan(&count); err != nil {
+			t.Fatalf("count imported observations: %v", err)
+		}
+		if count != 2 {
+			t.Fatalf("expected 2 imported observations, got %d", count)
+		}
+	})
+
+	t.Run("reimport", func(t *testing.T) {
+		s := newImportStore(t)
+		data := &ExportData{Observations: []Observation{newObservation("obs-import-replay", "original")}}
+		if _, err := s.Import(data); err != nil {
+			t.Fatalf("first Import: %v", err)
+		}
+
+		result, err := s.Import(data)
+		if err != nil {
+			t.Fatalf("replay Import: %v", err)
+		}
+		if result.ObservationsImported != 0 || result.ObservationsSkipped != 1 {
+			t.Fatalf("unexpected replay counts: imported=%d skipped=%d", result.ObservationsImported, result.ObservationsSkipped)
+		}
+
+		var count int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM observations WHERE sync_id = ?`, "obs-import-replay").Scan(&count); err != nil {
+			t.Fatalf("count replayed observation: %v", err)
+		}
+		if count != 1 {
+			t.Fatalf("expected one replayed observation, got %d", count)
+		}
+	})
+
+	t.Run("changed_content", func(t *testing.T) {
+		s := newImportStore(t)
+		if _, err := s.Import(&ExportData{Observations: []Observation{newObservation("obs-import-changed", "original")}}); err != nil {
+			t.Fatalf("first Import: %v", err)
+		}
+
+		result, err := s.Import(&ExportData{Observations: []Observation{newObservation("obs-import-changed", "replacement")}})
+		if err != nil {
+			t.Fatalf("changed-content Import: %v", err)
+		}
+		if result.ObservationsImported != 0 || result.ObservationsSkipped != 1 {
+			t.Fatalf("unexpected changed-content counts: imported=%d skipped=%d", result.ObservationsImported, result.ObservationsSkipped)
+		}
+
+		var content string
+		if err := s.db.QueryRow(`SELECT content FROM observations WHERE sync_id = ?`, "obs-import-changed").Scan(&content); err != nil {
+			t.Fatalf("read imported content: %v", err)
+		}
+		if content != "original" {
+			t.Fatalf("expected existing content to remain unchanged, got %q", content)
+		}
+	})
+
+	t.Run("payload_duplicate", func(t *testing.T) {
+		s := newImportStore(t)
+		data := &ExportData{Observations: []Observation{
+			newObservation("obs-import-payload-duplicate", "first"),
+			newObservation("obs-import-payload-duplicate", "second"),
+		}}
+
+		result, err := s.Import(data)
+		if err != nil {
+			t.Fatalf("Import: %v", err)
+		}
+		if result.ObservationsImported != 1 || result.ObservationsSkipped != 1 {
+			t.Fatalf("unexpected payload duplicate counts: imported=%d skipped=%d", result.ObservationsImported, result.ObservationsSkipped)
+		}
+
+		var count int
+		var content string
+		if err := s.db.QueryRow(`SELECT COUNT(*), content FROM observations WHERE sync_id = ?`, "obs-import-payload-duplicate").Scan(&count, &content); err != nil {
+			t.Fatalf("read payload duplicate: %v", err)
+		}
+		if count != 1 || content != "first" {
+			t.Fatalf("expected first payload entry only, got count=%d content=%q", count, content)
+		}
+	})
+}
+
+func TestImportObservationRollbackCounts(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("import-session", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create import session: %v", err)
+	}
+	project := "engram"
+	data := &ExportData{
+		Observations: []Observation{{
+			SyncID:         "obs-import-rollback",
+			SessionID:      "import-session",
+			Type:           "note",
+			Title:          "Rollback observation",
+			Content:        "must roll back",
+			Project:        &project,
+			Scope:          "project",
+			RevisionCount:  1,
+			DuplicateCount: 1,
+			CreatedAt:      "2026-07-24T12:00:00Z",
+			UpdatedAt:      "2026-07-24T12:00:00Z",
+		}},
+		Prompts: []Prompt{{
+			SyncID:    "prompt-import-hard-failure",
+			SessionID: "missing-session",
+			Content:   "trigger foreign key failure",
+			Project:   "engram",
+			CreatedAt: "2026-07-24T12:00:00Z",
+		}},
+	}
+
+	result, err := s.Import(data)
+	if err == nil {
+		t.Fatal("expected Import to fail")
+	}
+	if result != nil {
+		t.Fatalf("expected no counts on rollback, got %+v", result)
+	}
+
+	var observationCount int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM observations WHERE sync_id = ?`, "obs-import-rollback").Scan(&observationCount); err != nil {
+		t.Fatalf("count rolled-back observations: %v", err)
+	}
+	var promptCount int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM user_prompts WHERE sync_id = ?`, "prompt-import-hard-failure").Scan(&promptCount); err != nil {
+		t.Fatalf("count rolled-back prompts: %v", err)
+	}
+	if observationCount != 0 || promptCount != 0 {
+		t.Fatalf("expected transaction rollback, got observations=%d prompts=%d", observationCount, promptCount)
+	}
+}
+
 func TestExportProjectDoesNotLeakRowsOwnedByOtherProjectsViaSessionMembership(t *testing.T) {
 	s := newTestStore(t)
 

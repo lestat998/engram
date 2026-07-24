@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/Gentleman-Programming/engram/internal/timeutil"
 	sqlite "modernc.org/sqlite"
@@ -3168,6 +3169,9 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		ftsQuery = sanitizeFTSCandidates(query)
 	} else {
 		ftsQuery = sanitizeFTS(query)
+	}
+	if ftsQuery == "" {
+		return directResults, nil
 	}
 
 	sqlQ := `
@@ -6588,16 +6592,39 @@ func stripPrivateTags(s string) string {
 	return result
 }
 
-// sanitizeFTS wraps each word in quotes so FTS5 doesn't choke on special chars.
-// "fix auth bug" → `"fix" "auth" "bug"`
-func sanitizeFTS(query string) string {
-	words := strings.Fields(query)
-	for i, w := range words {
-		// Strip existing quotes to avoid double-quoting
-		w = strings.Trim(w, `"`)
-		words[i] = `"` + w + `"`
+func ftsTerms(query string) []string {
+	var terms []string
+	var term []rune
+	flush := func() {
+		if len(term) == 0 {
+			return
+		}
+		terms = append(terms, string(term))
+		term = term[:0]
 	}
-	return strings.Join(words, " ")
+
+	for _, r := range query {
+		if unicode.IsLetter(r) || unicode.IsNumber(r) || unicode.IsMark(r) {
+			term = append(term, r)
+			continue
+		}
+		flush()
+	}
+	flush()
+	return terms
+}
+
+func renderFTSQuery(terms []string, separator string) string {
+	quoted := make([]string, len(terms))
+	for i, term := range terms {
+		quoted[i] = `"` + strings.ReplaceAll(term, `"`, `""`) + `"`
+	}
+	return strings.Join(quoted, separator)
+}
+
+// sanitizeFTS renders safe terms with implicit AND semantics.
+func sanitizeFTS(query string) string {
+	return renderFTSQuery(ftsTerms(query), " ")
 }
 
 // ─── Passive Capture ─────────────────────────────────────────────────────────

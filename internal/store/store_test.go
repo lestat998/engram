@@ -8856,15 +8856,100 @@ func TestSearchMatchMode_SingleToken(t *testing.T) {
 	}
 }
 
-// TestSearchMatchMode_EmptyQueryAnyReturnsError pins that Search("", …{MatchMode:"any"})
-// returns an error — the FTS5 engine rejects an empty match expression, and this
-// behaviour is the same as the default AND mode with an empty query.
-func TestSearchMatchMode_EmptyQueryAnyReturnsError(t *testing.T) {
+func TestSearchMatchMode_EmptyQueryAnyReturnsNoMatches(t *testing.T) {
 	s := newTestStore(t)
 	seedMatchModeFixture(t, s)
 
-	_, err := s.Search("", SearchOptions{Project: "engram", Limit: 10, MatchMode: "any"})
-	if err == nil {
-		t.Fatal("expected error for empty query with match_mode=any, got nil")
+	results, err := s.Search("", SearchOptions{Project: "engram", Limit: 10, MatchMode: "any"})
+	if err != nil {
+		t.Fatalf("Search error: %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("expected no results for empty query, got %d", len(results))
+	}
+}
+
+func TestSanitizeFTS(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "plain words", input: "alpha beta", want: `"alpha" "beta"`},
+		{name: "interior quote", input: `alpha"beta`, want: `"alpha" "beta"`},
+		{name: "multiple quotes", input: `alpha"""beta`, want: `"alpha" "beta"`},
+		{name: "quote only", input: `"""`, want: ""},
+		{name: "Unicode punctuation", input: "café—東京", want: `"café" "東京"`},
+		{name: "mixed punctuation", input: `alpha!!!"beta"—gamma`, want: `"alpha" "beta" "gamma"`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := sanitizeFTS(tt.input); got != tt.want {
+				t.Fatalf("sanitizeFTS(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSearchPunctuationReliability(t *testing.T) {
+	tests := []struct {
+		name    string
+		query   string
+		wantAll []string
+		wantAny []string
+	}{
+		{name: "interior quote", query: `alpha"beta`, wantAll: []string{"all terms"}, wantAny: []string{"all terms", "alpha only", "beta only"}},
+		{name: "multiple quotes", query: `alpha"""beta`, wantAll: []string{"all terms"}, wantAny: []string{"all terms", "alpha only", "beta only"}},
+		{name: "quote only", query: `"""`, wantAll: nil, wantAny: nil},
+		{name: "Unicode punctuation", query: "café—東京", wantAll: []string{"all terms"}, wantAny: []string{"all terms", "café only", "東京 only"}},
+		{name: "mixed punctuation", query: `alpha!!!"beta"—gamma`, wantAll: []string{"all terms"}, wantAny: []string{"all terms", "alpha only", "beta only"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newTestStore(t)
+			if err := s.CreateSession("s-fts-punctuation", "engram", "/tmp"); err != nil {
+				t.Fatalf("create session: %v", err)
+			}
+			for _, p := range []AddObservationParams{
+				{SessionID: "s-fts-punctuation", Type: "decision", Title: "all terms", Content: "alpha beta gamma café 東京", Project: "engram", Scope: "project"},
+				{SessionID: "s-fts-punctuation", Type: "decision", Title: "alpha only", Content: "alpha", Project: "engram", Scope: "project"},
+				{SessionID: "s-fts-punctuation", Type: "decision", Title: "beta only", Content: "beta", Project: "engram", Scope: "project"},
+				{SessionID: "s-fts-punctuation", Type: "decision", Title: "café only", Content: "café", Project: "engram", Scope: "project"},
+				{SessionID: "s-fts-punctuation", Type: "decision", Title: "東京 only", Content: "東京", Project: "engram", Scope: "project"},
+			} {
+				if _, err := s.AddObservation(p); err != nil {
+					t.Fatalf("seed observation %q: %v", p.Title, err)
+				}
+			}
+
+			for _, mode := range []struct {
+				name string
+				want []string
+			}{
+				{name: "all", want: tt.wantAll},
+				{name: "any", want: tt.wantAny},
+			} {
+				t.Run(mode.name, func(t *testing.T) {
+					results, err := s.Search(tt.query, SearchOptions{Project: "engram", Limit: 10, MatchMode: mode.name})
+					if err != nil {
+						t.Fatalf("Search(%q, %s): %v", tt.query, mode.name, err)
+					}
+					got := make(map[string]bool, len(results))
+					for _, result := range results {
+						got[result.Title] = true
+					}
+					if len(got) != len(mode.want) {
+						t.Fatalf("Search(%q, %s) returned %v, want %v", tt.query, mode.name, got, mode.want)
+					}
+					for _, title := range mode.want {
+						if !got[title] {
+							t.Errorf("Search(%q, %s) missing %q; got %v", tt.query, mode.name, title, got)
+						}
+					}
+				})
+			}
+		})
 	}
 }

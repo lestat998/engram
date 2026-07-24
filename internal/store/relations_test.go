@@ -263,6 +263,81 @@ func TestFindCandidates_UnrelatedTitle(t *testing.T) {
 	}
 }
 
+func TestSanitizeFTSCandidates(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "interior quote", input: `alpha"beta`, want: `"alpha" OR "beta"`},
+		{name: "multiple quotes", input: `alpha"""beta`, want: `"alpha" OR "beta"`},
+		{name: "quote only", input: `"""`, want: ""},
+		{name: "Unicode punctuation", input: "café—東京", want: `"café" OR "東京"`},
+		{name: "mixed punctuation", input: `alpha!!!"beta"—gamma`, want: `"alpha" OR "beta" OR "gamma"`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := sanitizeFTSCandidates(tt.input); got != tt.want {
+				t.Fatalf("sanitizeFTSCandidates(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFindCandidatesPunctuationReliability(t *testing.T) {
+	tests := []struct {
+		name  string
+		query string
+		terms []string
+	}{
+		{name: "interior quote", query: `alpha"beta`, terms: []string{"alpha", "beta"}},
+		{name: "multiple quotes", query: `alpha"""beta`, terms: []string{"alpha", "beta"}},
+		{name: "quote only", query: `"""`, terms: nil},
+		{name: "Unicode punctuation", query: "café—東京", terms: []string{"café", "東京"}},
+		{name: "mixed punctuation", query: `alpha!!!"beta"—gamma`, terms: []string{"alpha", "beta", "gamma"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := setupRelationsStore(t)
+			wantIDs := make(map[int64]bool, len(tt.terms))
+			for _, term := range tt.terms {
+				id, _ := addTestObs(t, s, term+" reference", "decision", "testproject", "project")
+				wantIDs[id] = true
+			}
+			unrelatedID, _ := addTestObs(t, s, "database pooling", "decision", "testproject", "project")
+			savedID, _ := addTestObs(t, s, tt.query, "decision", "testproject", "project")
+
+			candidates, err := s.FindCandidates(savedID, CandidateOptions{
+				Project:    "testproject",
+				Scope:      "project",
+				Limit:      10,
+				BM25Floor:  ptrFloat64(-100.0),
+				SkipInsert: true,
+			})
+			if err != nil {
+				t.Fatalf("FindCandidates(%q): %v", tt.query, err)
+			}
+			gotIDs := make(map[int64]bool, len(candidates))
+			for _, candidate := range candidates {
+				gotIDs[candidate.ID] = true
+			}
+			if len(gotIDs) != len(wantIDs) {
+				t.Fatalf("FindCandidates(%q) returned IDs %v, want %v", tt.query, gotIDs, wantIDs)
+			}
+			for id := range wantIDs {
+				if !gotIDs[id] {
+					t.Errorf("FindCandidates(%q) missing candidate %d", tt.query, id)
+				}
+			}
+			if gotIDs[unrelatedID] {
+				t.Errorf("FindCandidates(%q) returned unrelated candidate %d", tt.query, unrelatedID)
+			}
+		})
+	}
+}
+
 // ─── C.5 — SaveRelation / GetRelationsForObservations / SkipsOrphaned ────────
 
 // TestSaveRelation verifies that SaveRelation inserts a pending relation row.
@@ -383,12 +458,12 @@ func TestJudgeRelation_HappyPath(t *testing.T) {
 
 	confidence := 0.9
 	judged, err := s.JudgeRelation(JudgeRelationParams{
-		JudgmentID:     relSyncID,
-		Relation:       "not_conflict",
-		Confidence:     &confidence,
-		MarkedByActor:  "agent:claude-sonnet-4-6",
-		MarkedByKind:   "agent",
-		MarkedByModel:  "claude-sonnet-4-6",
+		JudgmentID:    relSyncID,
+		Relation:      "not_conflict",
+		Confidence:    &confidence,
+		MarkedByActor: "agent:claude-sonnet-4-6",
+		MarkedByKind:  "agent",
+		MarkedByModel: "claude-sonnet-4-6",
 	})
 	if err != nil {
 		t.Fatalf("JudgeRelation: %v", err)
@@ -595,14 +670,14 @@ func TestProvenance_FullRowPersisted(t *testing.T) {
 	evidence := `{"basis":"title overlap"}`
 	reason := "titles are nearly identical"
 	judged, err := s.JudgeRelation(JudgeRelationParams{
-		JudgmentID:     relSyncID,
-		Relation:       "compatible",
-		Confidence:     &confidence,
-		Evidence:       &evidence,
-		Reason:         &reason,
-		MarkedByActor:  "agent:claude-sonnet-4-6",
-		MarkedByKind:   "agent",
-		MarkedByModel:  "claude-sonnet-4-6",
+		JudgmentID:    relSyncID,
+		Relation:      "compatible",
+		Confidence:    &confidence,
+		Evidence:      &evidence,
+		Reason:        &reason,
+		MarkedByActor: "agent:claude-sonnet-4-6",
+		MarkedByKind:  "agent",
+		MarkedByModel: "claude-sonnet-4-6",
 	})
 	if err != nil {
 		t.Fatalf("JudgeRelation: %v", err)
@@ -1101,7 +1176,7 @@ func TestJudgeRelation_RejectsCrossProject(t *testing.T) {
 }
 
 // C.1e — When the source observation is missing, JudgeRelation must enqueue a
-// mutation with project='' (empty string, not an error).
+// mutation with project=” (empty string, not an error).
 func TestJudgeRelation_MissingSource_EnqueuesEmptyProject(t *testing.T) {
 	s := setupEnrolledStore(t)
 

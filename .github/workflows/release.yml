@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing v* tag to release"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -12,10 +18,74 @@ jobs:
   goreleaser:
     runs-on: ubuntu-latest
     steps:
+      - name: Resolve release tag
+        id: release
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_TAG: ${{ github.ref_name }}
+          MANUAL_TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            tag="$MANUAL_TAG"
+            if [[ "$tag" != v* ]] || ! git check-ref-format "refs/tags/$tag"; then
+              echo "Manual release tag must be a valid Git tag beginning with v." >&2
+              exit 1
+            fi
+
+            repo_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+            auth_header="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w 0)"
+            tag_ref="refs/tags/$tag"
+            peeled_ref="${tag_ref}^{}"
+            remote_refs="$(git -c http.extraHeader="AUTHORIZATION: basic $auth_header" ls-remote --exit-code "$repo_url" "$tag_ref" "$peeled_ref")" || {
+              echo "Tag $tag does not exist in the remote repository." >&2
+              exit 1
+            }
+
+            tag_sha=""
+            direct_sha=""
+            while read -r sha ref; do
+              if [[ "$ref" == "$peeled_ref" ]]; then
+                tag_sha="$sha"
+              elif [[ "$ref" == "$tag_ref" ]]; then
+                direct_sha="$sha"
+              fi
+            done <<< "$remote_refs"
+            tag_sha="${tag_sha:-$direct_sha}"
+          else
+            tag="$PUSH_TAG"
+            tag_sha=""
+          fi
+
+          {
+            echo "tag=$tag"
+            echo "tag_sha=$tag_sha"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Checkout
         uses: actions/checkout@v6
         with:
+          ref: ${{ steps.release.outputs.tag }}
           fetch-depth: 0
+
+      - name: Verify manual release tag checkout
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          REMOTE_TAG_SHA: ${{ steps.release.outputs.tag_sha }}
+        run: |
+          set -euo pipefail
+
+          head_sha="$(git rev-parse HEAD)"
+          local_tag_sha="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+          if [[ "$head_sha" != "$REMOTE_TAG_SHA" || "$head_sha" != "$local_tag_sha" ]]; then
+            echo "Checked-out HEAD does not match tag $RELEASE_TAG." >&2
+            exit 1
+          fi
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -23,10 +93,22 @@ jobs:
           go-version: "1.25.10"
 
       - name: Run GoReleaser
+        if: github.event_name == 'push'
         uses: goreleaser/goreleaser-action@v7
         with:
           version: "~> v2"
           args: release --clean
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Run GoReleaser from manual tag
+        if: github.event_name == 'workflow_dispatch'
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GORELEASER_CURRENT_TAG: ${{ steps.release.outputs.tag }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}

@@ -44,6 +44,9 @@ changelog:
       - "^test:"
       - "^ci:"
 
+release:
+  replace_existing_artifacts: true
+
 brews:
   - repository:
       owner: Gentleman-Programming
